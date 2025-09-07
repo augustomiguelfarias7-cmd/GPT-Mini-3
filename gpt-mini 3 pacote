@@ -1,0 +1,194 @@
+import time
+import json
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from datasets import load_dataset, concatenate_datasets
+from transformers import PreTrainedModel, PretrainedConfig
+from datetime import datetime
+from PIL import Image
+import open_clip
+import whisper
+from dalle_pytorch import DALLE
+
+# ==== Tokenizer simples multilíngue ====
+class SimpleTokenizer:
+    def __init__(self, vocab_size=3_000_000):
+        self.vocab = {f"TOKEN_{i}": i for i in range(vocab_size)}
+        self.vocab["[PAD]"] = 0
+        self.vocab["[UNK]"] = 1
+        self.vocab_size = len(self.vocab)
+    
+    def encode(self, text):
+        return [self.vocab.get(tok, self.vocab["[UNK]"]) for tok in text.split()]
+    
+    def decode(self, ids):
+        inv_vocab = {v:k for k,v in self.vocab.items()}
+        return " ".join([inv_vocab.get(i,"[UNK]") for i in ids])
+
+# ==== Transformer Block ====
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_size, heads, ff_hidden):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=embed_size, num_heads=heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_size, ff_hidden),
+            nn.ReLU(),
+            nn.Linear(ff_hidden, embed_size)
+        )
+        self.norm2 = nn.LayerNorm(embed_size)
+    
+    def forward(self, x):
+        attn_out,_ = self.attn(x,x,x)
+        x = self.norm1(x + attn_out)
+        x = self.norm2(x + self.ff(x))
+        return x
+
+# ==== Config GPT-Mini 3 ====
+class GPTMini3Config(PretrainedConfig):
+    model_type = "gpt-mini-3"
+    def __init__(self, vocab_size=32000, n_embd=1024, n_layer=16, n_head=16, max_len=512, **kwargs):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.n_embd = n_embd
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.max_len = max_len
+
+# ==== GPT-Mini 3 com memória e modo agente ====
+class GPTMini3Agent(PreTrainedModel):
+    config_class = GPTMini3Config
+    
+    def __init__(self, config):
+        super().__init__(config)
+        self.token_emb = nn.Embedding(config.vocab_size, config.n_embd)
+        self.pos_emb = nn.Embedding(config.max_len, config.n_embd)
+        self.layers = nn.ModuleList([TransformerBlock(config.n_embd, config.n_head, config.n_embd*4)
+                                     for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.head = nn.Linear(config.n_embd, config.vocab_size)
+        
+        # Memória
+        self.short_term_memory = []
+        
+        # Multimodalidade
+        self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
+            'ViT-B-32', pretrained='laion2b_s32b_b82k'
+        )
+        self.whisper_model = whisper.load_model("base")
+        self.dalle_model = DALLE.load_model('path_to_dalle_model')  # ajustar
+        
+        # Controle de acesso de agentes
+        self.site_access_times = {}
+        self.site_permissions = {
+            "chatgpt": ["conversar", "gerar_codigo", "gerar_imagem"],
+            "gmail": ["criar_arquivo", "escrever_codigo"],
+            "drive": ["ler", "escrever", "criar_pasta"]
+        }
+
+    # ==== Memória ====
+    def add_to_memory(self, text):
+        self.short_term_memory.append(text)
+        if len(self.short_term_memory) > 10:
+            self.short_term_memory.pop(0)
+    
+    def get_memory(self):
+        return " ".join(self.short_term_memory)
+
+    # ==== Forward básico ====
+    def forward(self, input_ids, image=None, audio=None, memory=True):
+        B, T = input_ids.shape
+        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
+        x = self.token_emb(input_ids) + self.pos_emb(pos)
+        
+        if memory and self.short_term_memory:
+            mem_text = self.get_memory()
+            mem_ids = torch.tensor([self.token_emb.weight.shape[0]-1]*len(mem_text.split()),
+                                   dtype=torch.long).unsqueeze(0).to(input_ids.device)
+            mem_emb = self.token_emb(mem_ids)
+            x = torch.cat([mem_emb, x], dim=1)
+        
+        for layer in self.layers:
+            x = layer(x)
+        x = self.ln_f(x)
+        return self.head(x)
+    
+    # ==== Modo agente com controle de tempo ====
+    def enter_site(self, site_name):
+        if site_name not in self.site_permissions:
+            return f"❌ Acesso ao site {site_name} não permitido."
+        now = datetime.now()
+        if site_name in self.site_access_times:
+            elapsed = (now - self.site_access_times[site_name]).total_seconds()
+            if elapsed > 600:  # 10 minutos
+                del self.site_access_times[site_name]
+                return f"⏱ Tempo de acesso expirou para {site_name}."
+        else:
+            self.site_access_times[site_name] = now
+            return f"✅ Acesso liberado para {site_name}. Tempo máximo: 10 minutos."
+    
+    # ==== Funções multimodais simplificadas ====
+    def process_image(self, image_path):
+        image = Image.open(image_path).convert('RGB')
+        image_tensor = self.clip_preprocess(image).unsqueeze(0)
+        with torch.no_grad():
+            features = self.clip_model.encode_image(image_tensor)
+        return features
+
+    def transcribe_audio(self, audio_path):
+        result = self.whisper_model.transcribe(audio_path)
+        return result['text']
+
+    def generate_image(self, text_prompt):
+        image_tensor = self.dalle_model.generate_images(text_prompt)
+        image = Image.fromarray(image_tensor.numpy())
+        return image
+
+    # ==== Função para carregar todos os datasets do GPT-Mini 2.5 Turbo ====
+    def load_all_datasets(self, tokenizer, max_len=256):
+        langs = ["pt","en","fr","es","de","it","ru","zh","ja","ko"]
+        datasets_list = []
+
+        # Wikipédia multilíngue
+        for lang in langs:
+            datasets_list.append(load_dataset("wikipedia", f"20220301.{lang}", split="train"))
+
+        # OSCAR multilíngue
+        oscar_multi = load_dataset("oscar","unshuffled_deduplicated_multi", split="train")
+        datasets_list.append(oscar_multi)
+
+        # QA PT
+        qa_pt = load_dataset("cais/mmlu-pt", split="train")
+        datasets_list.append(qa_pt)
+
+        # Código: Python, JavaScript, Java, C++, C
+        code_langs = ["python", "javascript", "java", "cpp", "c"]
+        for lang in code_langs:
+            datasets_list.append(load_dataset("bigcode/the-stack-dedup", data_dir=f"data/{lang}", split="train"))
+
+        # Tokenização
+        def tokenize_fn(examples):
+            text_col = "text" if "text" in examples else list(examples.keys())[0]
+            texts = examples[text_col]
+            input_ids = [tokenizer.encode(t)[:max_len] for t in texts]
+            return {"input_ids": input_ids}
+
+        tokenized = [d.map(tokenize_fn, batched=True, remove_columns=d.column_names) for d in datasets_list]
+        dataset = concatenate_datasets(tokenized)
+        return dataset
+
+# ==== Exemplo de uso ====
+if __name__ == "__main__":
+    tokenizer = SimpleTokenizer()
+    config = GPTMini3Config(vocab_size=tokenizer.vocab_size)
+    model = GPTMini3Agent(config)
+    
+    # Entrando em sites
+    print(model.enter_site("chatgpt"))
+    print(model.enter_site("gmail"))
+
+    # Carregando datasets do GPT-Mini 2.5 Turbo
+    print("⏳ Carregando datasets multilíngues e de código...")
+    dataset = model.load_all_datasets(tokenizer)
+    print(f"✅ Dataset carregado com {len(dataset)} exemplos.")
