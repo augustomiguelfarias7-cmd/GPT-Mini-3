@@ -55,12 +55,12 @@ Agentes autônomos controlados em Python.
 
 ========================≈============
 pip install torch transformers datasets pillow open-clip-torch whisper dalle-pytorch beautifulsoup4 requests
-
+=============================
 
 gpt_mini_3/
 ├── __init__.py
 ├── agent.py         # contém GPTMini3Agent, SimpleTokenizer, GPTMini3Config
-
+===========================
 from gpt_mini_3 import GPTMini3Agent, SimpleTokenizer, GPTMini3Config
 
 tokenizer = SimpleTokenizer()
